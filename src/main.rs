@@ -1,6 +1,6 @@
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use futures::StreamExt;
-use std::io;
+use std::io::{self, BufRead};
 use std::process::Command;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -27,6 +27,23 @@ fn find_chromium() -> Option<String> {
     None
 }
 
+/// Converts a URL slug like "iphone-12-128gb-azul-1235801380" into "iphone 12 128gb azul"
+fn title_from_url(url: &str) -> String {
+    url.split("/item/")
+        .nth(1)
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .split('-')
+        .filter(|part| {
+            // Drop the trailing numeric ID (all-digit segment at the end)
+            !part.chars().all(|c| c.is_ascii_digit()) || part.len() < 7
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
 async fn dismiss_popups(page: &chromiumoxide::Page) {
     let js = r#"
         (function() {
@@ -45,54 +62,64 @@ async fn dismiss_popups(page: &chromiumoxide::Page) {
     let _ = page.evaluate(js).await;
 }
 
-async fn scrape_prices(page: &chromiumoxide::Page) -> Vec<(String, f64, String)> {
-    let js = r#"
-        (function() {
+async fn scrape_prices(
+    page: &chromiumoxide::Page,
+    keyword: &str,
+    blacklist: &[String],
+) -> Vec<(String, f64, String)> {
+    let keywords_json = serde_json::to_string(
+        &keyword
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+
+    let blacklist_json = serde_json::to_string(
+        &blacklist
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+
+    let js = format!(
+        r#"
+        (function() {{
+            const keywords = {keywords_json};
+            const blacklist = {blacklist_json};
             const results = [];
             const priceEls = document.querySelectorAll('strong[aria-label="Item price"]');
-            console.log('[scrape] Found price elements: ' + priceEls.length);
 
-            priceEls.forEach(el => {
-                // Walk up to find the anchor tag (the whole card is usually an <a>)
-                let card = el.closest('a[href]');
-                let url = 'unknown';
-                if (card) {
-                    url = card.href; // absolute URL
-                } else {
-                    // fallback: find nearest anchor in parent
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 6; i++) {
-                        if (!parent) break;
-                        const a = parent.querySelector('a[href]');
-                        if (a) { url = a.href; break; }
-                        parent = parent.parentElement;
-                    }
-                }
+            priceEls.forEach(el => {{
+                const card = el.closest('a[href]');
+                const url = card ? card.href : 'unknown';
 
-                // Get title
-                let title = 'unknown';
-                const container = el.closest('[class*="ItemCard"]') || el.closest('a') || el.parentElement;
-                if (container) {
-                    const titleEl = container.querySelector('h3[class*="title"], h3[class*="Title"]')
-                        || container.querySelector('h3');
-                    if (titleEl) title = titleEl.textContent.trim();
-                }
-
-                // Parse price: "130 €" or "1.200 €"
+                // Parse price
                 const raw = el.textContent.replace(/\u00a0/g, ' ').trim();
                 const numeric = raw.replace(/[^\d,.]/g, '').replace('.', '').replace(',', '.');
                 const price = parseFloat(numeric);
 
-                if (!isNaN(price)) {
-                    results.push({ title, price, url });
-                } else {
-                    console.log('[scrape] Could not parse price from: ' + raw);
-                }
-            });
+                if (!isNaN(price) && url !== 'unknown') {{
+                    // Extract slug from URL for filtering — title cleaning done in Rust
+                    const slug = url.split('/item/')[1] || '';
+                    const slugLower = slug.toLowerCase();
+
+                    const matchesKeyword = keywords.every(kw => slugLower.includes(kw));
+                    const isBlacklisted = blacklist.some(word => slugLower.includes(word));
+
+                    if (matchesKeyword && !isBlacklisted) {{
+                        results.push({{ price, url }});
+                    }} else {{
+                        console.log('[filtered] ' + slug + ' => ' + price + '€');
+                    }}
+                }}
+            }});
 
             return JSON.stringify(results);
-        })()
-    "#;
+        }})()
+    "#
+    );
 
     match page.evaluate(js).await {
         Ok(result) => {
@@ -105,9 +132,9 @@ async fn scrape_prices(page: &chromiumoxide::Page) -> Vec<(String, f64, String)>
                 Ok(items) => items
                     .iter()
                     .filter_map(|item| {
-                        let title = item["title"].as_str().unwrap_or("unknown").to_string();
                         let price = item["price"].as_f64()?;
                         let url = item["url"].as_str().unwrap_or("unknown").to_string();
+                        let title = title_from_url(&url);
                         Some((title, price, url))
                     })
                     .collect(),
@@ -127,11 +154,6 @@ async fn scrape_prices(page: &chromiumoxide::Page) -> Vec<(String, f64, String)>
 async fn click_load_more(page: &chromiumoxide::Page) -> bool {
     let js = r#"
         (function() {
-            const wallaBtn = document.querySelector('walla-button[text="Cargar más"]');
-            if (wallaBtn && wallaBtn.shadowRoot) {
-                const btn = wallaBtn.shadowRoot.querySelector('button');
-                if (btn) { btn.click(); return true; }
-            }
             const allBtns = document.querySelectorAll('walla-button');
             for (const wb of allBtns) {
                 if (wb.getAttribute('text') === 'Cargar más') {
@@ -152,17 +174,45 @@ async fn click_load_more(page: &chromiumoxide::Page) -> bool {
     }
 }
 
+fn read_line(prompt: &str) -> String {
+    print!("{}", prompt);
+    let _ = io::Write::flush(&mut io::stdout());
+    let stdin = io::stdin();
+    stdin
+        .lock()
+        .lines()
+        .next()
+        .unwrap_or(Ok(String::new()))
+        .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Search keyword:");
-    let mut keyword = String::new();
-    io::stdin().read_line(&mut keyword)?;
+    let keyword = read_line("Search keyword:\n");
     let keyword = keyword.trim().to_string();
 
-    println!("Max listings to analyze:");
-    let mut limit = String::new();
-    io::stdin().read_line(&mut limit)?;
-    let limit: usize = limit.trim().parse().unwrap_or(50);
+    let limit_str = read_line("Max listings to analyze:\n");
+    let limit: usize = limit_str.trim().parse().unwrap_or(50);
+
+    // Blacklist input
+    println!("Enter blacklist words (comma-separated), or press Enter to skip:");
+    println!("  e.g: funda,cargador,bateria,cable,pack");
+    let blacklist_input = read_line("");
+    let blacklist: Vec<String> = if blacklist_input.trim().is_empty() {
+        vec![]
+    } else {
+        blacklist_input
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    if blacklist.is_empty() {
+        println!("No blacklist words set.");
+    } else {
+        println!("Blacklist: {:?}", blacklist);
+    }
 
     let browser_path = find_chromium().expect("No Chromium browser found");
     println!("Using browser: {}", browser_path);
@@ -199,17 +249,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        let found = scrape_prices(&page).await;
-        println!("[scrape] Got {} items from DOM", found.len());
+        let found = scrape_prices(&page, &keyword, &blacklist).await;
+        println!("[scrape] Got {} matching items from DOM", found.len());
 
-        for (title, price, url) in found {
-            let key = format!("{}:{}", title, price);
+        for (title, price, item_url) in found {
+            let key = format!("{}:{}", item_url, price); // URL is more unique than title
             if !seen.contains(&key) {
                 seen.insert(key);
-                println!("  + '{}' => {:.2}€  ({})", title, price, url);
+                println!("  + '{}' => {:.2}€  ({})", title, price, item_url);
                 prices.push(price);
                 titles.push(title);
-                urls.push(url);
+                urls.push(item_url);
             }
         }
 
@@ -235,6 +285,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     titles.truncate(limit);
     urls.truncate(limit);
 
+    if prices.is_empty() {
+        println!("No prices found.");
+        return Ok(());
+    }
+
     let sum: f64 = prices.iter().sum();
     let avg = sum / prices.len() as f64;
 
@@ -243,9 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Average price: {:.2}€", avg);
 
     println!("\nDo you want to download the results? (y/n)");
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-
+    let answer = read_line("");
     if answer.trim().to_lowercase() == "y" {
         let mut wtr = csv::Writer::from_path("wallapop_results.csv")?;
         wtr.write_record(["title", "price", "url"])?;
@@ -257,7 +310,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ])?;
         }
         wtr.flush()?;
+        wtr.write_record(&["", "", ""])?;
+        wtr.write_record(&["Listings analyzed", &prices.len().to_string(), ""])?;
+        wtr.write_record(&["Average price", &format!("{:.2}€", avg), ""])?;
+        wtr.flush()?;
         println!("Results saved to wallapop_results.csv");
+        // Print summary again as the final line so it's always last in output
+        println!("\n=== RESULTS ===");
+        println!("Listings analyzed: {}", prices.len());
+        println!("Average price: {:.2}€", avg);
+        println!("Results saved to wallapop_results.csv");
+    } else {
+        // Already printed above, but reprint so it's the last thing shown
+        println!("\n=== RESULTS ===");
+        println!("Listings analyzed: {}", prices.len());
+        println!("Average price: {:.2}€", avg);
     }
 
     Ok(())
