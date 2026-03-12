@@ -1,5 +1,6 @@
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::io::{self, BufRead};
 use std::process::Command;
 use std::time::Duration;
@@ -152,26 +153,32 @@ async fn scrape_prices(
 }
 
 async fn click_load_more(page: &chromiumoxide::Page) -> bool {
-    let js = r#"
-        (function() {
-            const allBtns = document.querySelectorAll('walla-button');
-            for (const wb of allBtns) {
-                if (wb.getAttribute('text') === 'Cargar más') {
-                    if (wb.shadowRoot) {
-                        const btn = wb.shadowRoot.querySelector('button');
-                        if (btn) { btn.click(); return true; }
-                    }
-                    wb.click();
-                    return true;
+    for _ in 0..20 {
+        let js = r#"
+            (function() {
+                const btn = document.querySelector('walla-button[text="Cargar más"]');
+                if (!btn) return false;
+
+                if (btn.shadowRoot) {
+                    const b = btn.shadowRoot.querySelector('button');
+                    if (b) { b.click(); return true; }
                 }
+
+                btn.click();
+                return true;
+            })()
+        "#;
+
+        if let Ok(res) = page.evaluate(js).await {
+            if res.value().and_then(|v| v.as_bool()).unwrap_or(false) {
+                return true;
             }
-            return false;
-        })()
-    "#;
-    match page.evaluate(js).await {
-        Ok(result) => result.value().and_then(|v| v.as_bool()).unwrap_or(false),
-        Err(_) => false,
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
+
+    false
 }
 
 fn read_line(prompt: &str) -> String {
@@ -184,6 +191,15 @@ fn read_line(prompt: &str) -> String {
         .next()
         .unwrap_or(Ok(String::new()))
         .unwrap_or_default()
+}
+
+async fn scroll_down(page: &chromiumoxide::Page) {
+    let js = r#"
+    window.scrollBy(0, window.innerHeight * 20);
+    window.dispatchEvent(new Event('scroll'));
+    "#;
+
+    let _ = page.evaluate(js).await;
 }
 
 #[tokio::main]
@@ -215,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let browser_path = find_chromium().expect("No Chromium browser found");
+    let user_data_dir = "/tmp/wallapop_scraper_profile";
     println!("Using browser: {}", browser_path);
 
     let (mut browser, mut handler) = Browser::launch(
@@ -225,6 +242,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--lang=es",
+                "--disable-background-networking",
+                "--disable-features=RendererCodeIntegrity",
+                "--disable-site-isolation-trials",
+                "--no-first-run",
+                "--incognito",
+                "--no-default-browser-check",
+                "--blink-settings=imagesEnabled=false",
+                &format!("--user-data-dir={}", user_data_dir),
             ])
             .with_head()
             .build()?,
@@ -239,24 +264,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     page.goto(&url).await?;
 
     println!("[nav] Waiting for page to load...");
-    sleep(Duration::from_secs(4)).await;
+    sleep(Duration::from_millis(60)).await;
     dismiss_popups(&page).await;
-    sleep(Duration::from_secs(1)).await;
 
     let mut prices: Vec<f64> = Vec::new();
     let mut titles: Vec<String> = Vec::new();
     let mut urls: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    println!("[init] Waiting for 'Cargar más'...");
+
+    if click_load_more(&page).await {
+        println!("[init] Infinite scroll activated");
+        sleep(Duration::from_millis(200)).await;
+    } else {
+        println!("[init] No load-more button found");
+    }
 
     loop {
         let found = scrape_prices(&page, &keyword, &blacklist).await;
         println!("[scrape] Got {} matching items from DOM", found.len());
 
         for (title, price, item_url) in found {
-            let key = format!("{}:{}", item_url, price); // URL is more unique than title
+            let key = format!("{}:{}", item_url, price);
+
             if !seen.contains(&key) {
                 seen.insert(key);
-                println!("  + '{}' => {:.2}€  ({})", title, price, item_url);
+
+                println!("  + '{}' => {:.2}€ ({})", title, price, item_url);
+
                 prices.push(price);
                 titles.push(title);
                 urls.push(item_url);
@@ -264,19 +300,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("[loop] Unique collected: {}/{}", prices.len(), limit);
+
         if prices.len() >= limit {
             break;
         }
 
-        println!("[loop] Clicking 'Cargar más'...");
-        let clicked = click_load_more(&page).await;
-        if !clicked {
-            println!("[loop] No 'Cargar más' button found, done.");
-            break;
-        }
+        println!("[scroll] Scrolling for more listings...");
+        scroll_down(&page).await;
 
-        println!("[loop] Waiting for new items to render...");
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_millis(70)).await;
     }
 
     browser.close().await?;
@@ -300,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nDo you want to download the results? (y/n)");
     let answer = read_line("");
     if answer.trim().to_lowercase() == "y" {
-        let mut wtr = csv::Writer::from_path("wallapop_results.csv")?;
+        let mut wtr = csv::Writer::from_path("average_price.csv")?;
         wtr.write_record(["title", "price", "url"])?;
         for i in 0..prices.len() {
             wtr.write_record(&[
@@ -314,18 +346,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wtr.write_record(&["Listings analyzed", &prices.len().to_string(), ""])?;
         wtr.write_record(&["Average price", &format!("{:.2}€", avg), ""])?;
         wtr.flush()?;
-        println!("Results saved to wallapop_results.csv");
+        println!("Results saved to average_price.csv");
         // Print summary again as the final line so it's always last in output
         println!("\n=== RESULTS ===");
         println!("Listings analyzed: {}", prices.len());
         println!("Average price: {:.2}€", avg);
-        println!("Results saved to wallapop_results.csv");
+        println!("Results saved to average_price.csv");
     } else {
         // Already printed above, but reprint so it's the last thing shown
         println!("\n=== RESULTS ===");
         println!("Listings analyzed: {}", prices.len());
         println!("Average price: {:.2}€", avg);
     }
-
+    let _ = std::fs::remove_dir_all("/tmp/wallapop_scraper_profile");
     Ok(())
 }
