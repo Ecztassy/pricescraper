@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 use tokio::time::sleep;
 
+// chromium instance
 fn find_chromium() -> Option<String> {
     let browsers = [
         "chromium",
@@ -28,7 +29,7 @@ fn find_chromium() -> Option<String> {
     None
 }
 
-/// Converts a URL slug like "iphone-12-128gb-azul-1235801380" into "iphone 12 128gb azul"
+/// Url format
 fn title_from_url(url: &str) -> String {
     url.split("/item/")
         .nth(1)
@@ -36,7 +37,7 @@ fn title_from_url(url: &str) -> String {
         .trim_end_matches('/')
         .split('-')
         .filter(|part| {
-            // Drop the trailing numeric ID (all-digit segment at the end)
+            // Remove ID
             !part.chars().all(|c| c.is_ascii_digit()) || part.len() < 7
         })
         .collect::<Vec<_>>()
@@ -44,7 +45,7 @@ fn title_from_url(url: &str) -> String {
         .trim()
         .to_string()
 }
-
+// get rid of cookies pop up
 async fn dismiss_popups(page: &chromiumoxide::Page) {
     let js = r#"
         (function() {
@@ -63,6 +64,7 @@ async fn dismiss_popups(page: &chromiumoxide::Page) {
     let _ = page.evaluate(js).await;
 }
 
+//get prices, define keywords, blacklist
 async fn scrape_prices(
     page: &chromiumoxide::Page,
     keyword: &str,
@@ -152,6 +154,7 @@ async fn scrape_prices(
     }
 }
 
+//load more button, only needs to be cliked once then wallapop changes to infinite scroll
 async fn click_load_more(page: &chromiumoxide::Page) -> bool {
     for _ in 0..20 {
         let js = r#"
@@ -180,7 +183,7 @@ async fn click_load_more(page: &chromiumoxide::Page) -> bool {
 
     false
 }
-
+//Read
 fn read_line(prompt: &str) -> String {
     print!("{}", prompt);
     let _ = io::Write::flush(&mut io::stdout());
@@ -192,7 +195,7 @@ fn read_line(prompt: &str) -> String {
         .unwrap_or(Ok(String::new()))
         .unwrap_or_default()
 }
-
+//Scrolling down the page
 async fn scroll_down(page: &chromiumoxide::Page) {
     let js = r#"
     window.scrollBy(0, window.innerHeight * 20);
@@ -202,12 +205,14 @@ async fn scroll_down(page: &chromiumoxide::Page) {
     let _ = page.evaluate(js).await;
 }
 
+//main fucntion, use tokyo for async execution
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    //read user input and convert to string
     let keyword = read_line("Search keyword:\n");
     let keyword = keyword.trim().to_string();
 
-    let limit_str = read_line("Max listings to analyze:\n");
+    let limit_str = read_line("Max listings to analyze:\n"); //define limits
     let limit: usize = limit_str.trim().parse().unwrap_or(50);
 
     // Blacklist input
@@ -215,40 +220,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  e.g: funda,cargador,bateria,cable,pack");
     let blacklist_input = read_line("");
     let blacklist: Vec<String> = if blacklist_input.trim().is_empty() {
+        //string to vector
         vec![]
     } else {
         blacklist_input
-            .split(',')
+            .split(',') // separation of terms
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect()
     };
 
     if blacklist.is_empty() {
+        //handle empty string
         println!("No blacklist words set.");
     } else {
         println!("Blacklist: {:?}", blacklist);
     }
 
-    let browser_path = find_chromium().expect("No Chromium browser found");
-    let user_data_dir = "/tmp/wallapop_scraper_profile";
-    println!("Using browser: {}", browser_path);
+    let browser_path = find_chromium().expect("No Chromium browser found"); //no browser found
+    let user_data_dir = "/tmp/wallapop_scraper_profile"; //temp browser profile
+    println!("Using browser: {}", browser_path); //which
 
     let (mut browser, mut handler) = Browser::launch(
+        //browser flags
         BrowserConfig::builder()
             .chrome_executable(browser_path)
             .args(vec![
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--lang=es",
-                "--disable-background-networking",
+                "--disable-gpu",                   //no gpu accel
+                "--lang=es",                       //language
+                "--disable-background-networking", //no internet access in backgroud
                 "--disable-features=RendererCodeIntegrity",
                 "--disable-site-isolation-trials",
                 "--no-first-run",
-                "--incognito",
+                "--incognito", //icognito
                 "--no-default-browser-check",
-                "--blink-settings=imagesEnabled=false",
                 &format!("--user-data-dir={}", user_data_dir),
             ])
             .with_head()
@@ -256,25 +263,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+    tokio::spawn(async move { while let Some(_) = handler.next().await {} }); //spawn _ for non named vars
 
-    let page = browser.new_page("about:blank").await?;
-    let url = format!("https://es.wallapop.com/app/search?keywords={}", keyword);
+    let page = browser.new_page("about:blank").await?; //open blank page
+    let url = format!("https://es.wallapop.com/app/search?keywords={}", keyword); //wallapop search url
     println!("[nav] Going to {}", url);
-    page.goto(&url).await?;
+    page.goto(&url).await?; //navigate to url
 
     println!("[nav] Waiting for page to load...");
-    sleep(Duration::from_millis(60)).await;
-    dismiss_popups(&page).await;
+    sleep(Duration::from_millis(60)).await; //wait time
+    dismiss_popups(&page).await; //exec demiss popups
 
-    let mut prices: Vec<f64> = Vec::new();
-    let mut titles: Vec<String> = Vec::new();
-    let mut urls: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut prices: Vec<f64> = Vec::new(); //64 bit int for price num
+    let mut titles: Vec<String> = Vec::new(); //String for name
+    let mut urls: Vec<String> = Vec::new(); //String for listing URL
+    let mut seen: HashSet<String> = HashSet::new(); //seen status
 
     println!("[init] Waiting for 'Cargar más'...");
 
     if click_load_more(&page).await {
+        //wait for button click to enable infinite scrolling
         println!("[init] Infinite scroll activated");
         sleep(Duration::from_millis(200)).await;
     } else {
@@ -282,6 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop {
+        //loop scrolling
         let found = scrape_prices(&page, &keyword, &blacklist).await;
         println!("[scrape] Got {} matching items from DOM", found.len());
 
@@ -302,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[loop] Unique collected: {}/{}", prices.len(), limit);
 
         if prices.len() >= limit {
+            //stop loop when number input is reached
             break;
         }
 
@@ -311,17 +321,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sleep(Duration::from_millis(70)).await;
     }
 
-    browser.close().await?;
-
+    browser.close().await?; //close browser window
+    //cut extra results
     prices.truncate(limit);
     titles.truncate(limit);
     urls.truncate(limit);
-
+    //empty search handle
     if prices.is_empty() {
         println!("No prices found.");
         return Ok(());
     }
-
+    //Average
     let sum: f64 = prices.iter().sum();
     let avg = sum / prices.len() as f64;
 
@@ -332,9 +342,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nDo you want to download the results? (y/n)");
     let answer = read_line("");
     if answer.trim().to_lowercase() == "y" {
-        let mut wtr = csv::Writer::from_path("average_price.csv")?;
+        //handle uppercase
+        let mut wtr = csv::Writer::from_path("average_price.csv")?; //save to csv
         wtr.write_record(["title", "price", "url"])?;
         for i in 0..prices.len() {
+            //get all lines after cut
             wtr.write_record(&[
                 titles.get(i).unwrap_or(&"unknown".to_string()),
                 &prices[i].to_string(),
@@ -358,6 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Listings analyzed: {}", prices.len());
         println!("Average price: {:.2}€", avg);
     }
-    let _ = std::fs::remove_dir_all("/tmp/wallapop_scraper_profile");
-    Ok(())
+    let _ = std::fs::remove_dir_all("/tmp/wallapop_scraper_profile"); //delete browser temp profiles
+    Ok(()) //quit
 }
